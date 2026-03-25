@@ -2,77 +2,73 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from database import get_db
 from models.complaint import Complaint, TicketStatus
+from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/health", tags=["Ward Health"])
 
-def calculate_health_score(ward_id: int, db: Session):
+def calculate_ward_health(ward_id: int, db: Session):
     all_complaints = db.query(Complaint).filter(Complaint.ward_id == ward_id).all()
 
     if not all_complaints:
-        return {
-            "score": 100,
-            "color": "green",
-            "total_complaints": 0,
-            "open": 0,
-            "in_progress": 0,
-            "resolved": 0
-        }
+        return 100  # no complaints = perfect score
 
     total = len(all_complaints)
-    open_count = len([c for c in all_complaints if c.status == TicketStatus.open])
-    in_progress = len([c for c in all_complaints if c.status == TicketStatus.in_progress])
-    resolved = len([c for c in all_complaints if c.status == TicketStatus.resolved])
 
-    # Resolution rate (30 points)
-    resolution_rate = (resolved / total) * 30
+    # 1. Resolution rate (30 points)
+    resolved = [c for c in all_complaints if c.status in [TicketStatus.resolved, TicketStatus.closed]]
+    resolution_rate = (len(resolved) / total) * 30
 
-    # Response rate — tickets that got a remark (25 points)
-    remarked = len([c for c in all_complaints if c.worker_remark is not None])
-    response_score = (remarked / total) * 25
+    # 2. Response time score (25 points)
+    # if worker remarked = good response, else bad
+    remarked = [c for c in all_complaints if c.worker_remark is not None]
+    response_score = (len(remarked) / total) * 25
 
-    # Penalty for open tickets sitting unattended (25 points deducted)
-    open_penalty = (open_count / total) * 25
+    # 3. Severity penalty (25 points deducted)
+    # complaints older than 8 hrs with no remark = severe
+    cutoff = datetime.utcnow() - timedelta(hours=8)
+    severe = [
+        c for c in all_complaints
+        if c.worker_remark is None
+        and c.status == TicketStatus.open
+        and c.created_at.replace(tzinfo=None) < cutoff
+    ]
+    severity_penalty = min((len(severe) / total) * 25, 25)
 
-    # Base score starts at 45 (feedback score placeholder = 20 pts assumed neutral)
-    score = 45 + resolution_rate + response_score - open_penalty
+    # 4. Feedback placeholder (20 points) — full marks for now
+    feedback_score = 20
 
-    # Clamp between 0 and 100
-    score = max(0, min(100, round(score)))
+    score = resolution_rate + response_score + feedback_score - severity_penalty
+    return round(max(0, min(100, score)), 2)
 
-    # Color band
+def get_color(score):
     if score >= 70:
-        color = "green"
+        return "green"
     elif score >= 40:
-        color = "yellow"
+        return "yellow"
     else:
-        color = "red"
-
-    return {
-        "score": score,
-        "color": color,
-        "total_complaints": total,
-        "open": open_count,
-        "in_progress": in_progress,
-        "resolved": resolved
-    }
+        return "red"
 
 @router.get("/{ward_id}")
-def get_ward_health(ward_id: int, db: Session = Depends(get_db)):
-    result = calculate_health_score(ward_id, db)
+def ward_health(ward_id: int, db: Session = Depends(get_db)):
+    score = calculate_ward_health(ward_id, db)
     return {
         "ward_id": ward_id,
-        **result
+        "health_score": score,
+        "color": get_color(score),
+        "label": "green = healthy, yellow = needs attention, red = critical"
     }
 
 @router.get("/city/all")
-def get_all_wards_health(db: Session = Depends(get_db)):
-    # Get all unique ward IDs that have complaints
-    ward_ids = db.query(Complaint.ward_id).distinct().all()
-    ward_ids = [w[0] for w in ward_ids if w[0] is not None]
-
-    results = []
-    for ward_id in ward_ids:
-        health = calculate_health_score(ward_id, db)
-        results.append({"ward_id": ward_id, **health})
-
-    return results
+def all_wards_health(db: Session = Depends(get_db)):
+    from models.ward import Ward
+    wards = db.query(Ward).all()
+    result = []
+    for ward in wards:
+        score = calculate_ward_health(ward.id, db)
+        result.append({
+            "ward_id": ward.id,
+            "ward_name": ward.name,
+            "health_score": score,
+            "color": get_color(score)
+        })
+    return result
